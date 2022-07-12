@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+#
+# telnettext: ORF Teletext HTML to ANSI
+# Copyright (C) 2022 Thomas Perl <m@thp.io>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+
+"""
+This tool parses the HTML pages at text.orf.at and converts
+them to ANSI escape sequences to be read in your terminal.
+
+---------
+
+Commands understood in --interactive/-i mode:
+
+    [channel:]000[.0] .... Navigate to channel, page, subpage
+    j .................... Go to next page
+    k .................... Go to previous page
+    h .................... Go to previous subpage
+    l .................... Go to next subpage
+    p .................... Go back one page in history
+    q .................... Exit interactive mode
+
+
+Examples:
+
+    orfiii:100 ........... Go to ORFIII, page 100
+    100.3 ................ Go to page 100, subpage 3
+    orf1: ................ Switch channel to ORF1
+    .4 ................... Go to subpage 4
+    200 .................. Go to page 100, subpage 1
+
+"""
+
+import re
+import argparse
+import html.parser
+import urllib.request
+
+parser = argparse.ArgumentParser(description='ORF Teletext HTML to ANSI')
+parser.add_argument('page', type=int, nargs='?', default=100, help='Page number (e.g. 100 or 886)')
+parser.add_argument('sub', type=int, nargs='?', default=1, help='Sub-page number (e.g. 1)')
+parser.add_argument('--channel', '-c', type=str, nargs='?', default='orf1',
+                    help='Channel (orf1, orf2, orfiii, sportplus)')
+parser.add_argument('--interactive', '-i', action='store_true', help='Interactive browsing mode')
+args = parser.parse_args()
+
+colormap = {
+    'black': 30,
+    'red': 31,
+    'green': 32,
+    'yellow': 33,
+    'blue': 34,
+    'magenta': 35,
+    'cyan': 36,
+    'white': 37,
+}
+
+for k, v in dict(colormap).items():
+    colormap[f'G{k}'] = v
+
+class TeletextHTMLParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.path = []
+        self.pagewrapper = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+
+        if tag == 'div' and a.get('id') == 'pagewrapper':
+            self.pagewrapper = True
+
+        self.path.append((tag, a))
+        if self.pagewrapper:
+            if tag == 'div' and a.get('class') == 'line':
+                print()  # newline
+            if tag == 'div' and a.get('class') == 'run':
+                bg = a['data-bg']
+                fg = a['data-fg']
+                fgi = colormap[fg]
+                bgi = colormap[bg] + 10
+                print(end='\033[%d;%dm' % (fgi, bgi))
+                if a.get('data-flash') == 'true':
+                    # https://www.real-world-systems.com/docs/ANSIcode.html#bridim
+                    print(end='\033[5m')
+                if a.get('data-size') == 'double size':
+                    print(end='\033#3')  # TODO: Store + print next line with #4
+                if a.get('data-size') == 'double width':
+                    print(end='\033#6')  # FIXME: Non-double-width prefix/suffix not handled
+                if a.get('data-size') == 'double height':
+                    ...  # TODO: ANSI seems to not support single-width, double-height
+
+    def handle_endtag(self, tag):
+        _, a = self.path.pop()
+        if tag == 'div' and a.get('class') == 'run':
+            print(end='\033[0m')
+        if tag == 'div' and a.get('id') == 'pagewrapper':
+            self.pagewrapper = False
+            print()  # newline
+
+    def handle_data(self, data):
+        if self.pagewrapper:
+            tag, a = self.path[-1]
+            if (tag == 'div' and a.get('class') == 'run') or (tag == 'a'):
+                if a.get('data-charcode') is not None:
+                    assert a['data-charcode'][-1] == 'h'
+                    codepoint = int(a['data-charcode'][:-1], 16)
+
+                    # https://text.orf.at/channel/orf1/page/886/1.html
+                    # https://en.wikipedia.org/wiki/Teletext_character_set
+                    if codepoint >= 0x20 and codepoint <= 0x2F:
+                        data = ' 🬀🬁🬂🬃🬄🬅🬆🬇🬈🬉🬊🬋🬌🬍🬎'[codepoint - 0x20]
+                    elif codepoint >= 0x30 and codepoint <= 0x3F:
+                        data = '🬏🬐🬑🬒🬓▌🬔🬕🬖🬗🬘🬙🬚🬛🬜🬝'[codepoint - 0x30]
+                    elif codepoint >= 0x60 and codepoint <= 0x6F:
+                        data = '🬞🬟🬠🬡🬢🬣🬤🬥🬦🬧▐🬨🬩🬪🬫🬬'[codepoint - 0x60]
+                    elif codepoint >= 0x70 and codepoint <= 0x7F:
+                        data = '🬭🬮🬯🬰🬱🬲🬳🬴🬵🬶🬷🬸🬹🬺🬻█'[codepoint - 0x70]
+                    else:
+                        raise ValueError(codepoint)
+
+                print(data, end='')
+
+
+page = args.page
+sub = args.sub
+channel = args.channel
+
+history = []
+
+while True:
+    history.append((page, sub))
+
+    print(f'\033[2J\033[Htelnettext {channel}:{page:03d}.{sub} [2022 thp.io]')
+
+    try:
+        f = urllib.request.urlopen(f'https://text.orf.at/channel/{channel}/page/{page}/{sub}.html')
+        d = f.read().decode()
+
+        parser = TeletextHTMLParser()
+        parser.feed(d)
+    except urllib.error.HTTPError as e:
+        print(f'HTTP Error: {e}')
+
+    if not args.interactive:
+        break
+
+    d = input('([channel:]000[.0]|hjklpq|help)> ')
+    if not d:
+        break
+
+    if d == 'help':
+        print(__doc__)
+        input('press any key to continue')
+
+    m = re.match(r'^(?:(orf1|orf2|orfiii|sportplus)?[:])?(?:(?:(\d{3}))?(?:[.](\d+))?)?$', d)
+    if m is not None:
+        channel = m.group(1) or channel
+        page = int(m.group(2) or page)
+        if m.group(2) is not None:
+            sub = 1
+        sub = int(m.group(3) or sub)
+
+    if d == 'q':
+        break
+
+    if d == 'h':
+        sub = max(1, sub - 1)
+    elif d == 'j':
+        page += 1
+    elif d == 'k':
+        page -= 1
+    elif d == 'l':
+        sub += 1
+    elif d == 'p' and len(history) > 1:
+        history.pop()
+        page, sub = history.pop()
+
+    page = max(100, min(999, page))
+    sub = max(1, sub)
+
